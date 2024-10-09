@@ -1,0 +1,24 @@
+services:
+  app:
+    image: luftdaten/update
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 80 --reload"
+    expose:
+      - 80
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.luftdaten-update.entrypoints=https"
+      - "traefik.http.routers.luftdaten-update.rule=(Host(`update.luftdaten.at`))"
+      - "traefik.http.routers.luftdaten-update.tls=true"
+      - "traefik.http.routers.luftdaten-update.tls.certresolver=http"
+      - "traefik.http.routers.luftdaten-update.service=luftdaten-update"
+      - "traefik.http.services.luftdaten-update.loadbalancer.server.port=80"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.luftdaten-update.middlewares=default@file"
+    networks:
+      - proxy
+    env_file:
+      - .env
+networks:
+  proxy:
+    external: true
