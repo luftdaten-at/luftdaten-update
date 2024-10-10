@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import routers
+from routers import router
 
 app = FastAPI()
 
@@ -15,4 +15,4 @@ app.add_middleware(
 )
 
 # Register routers
-app.include_router(routers, prefix="")
+app.include_router(router, prefix="")
