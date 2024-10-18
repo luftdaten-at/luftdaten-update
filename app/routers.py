@@ -27,6 +27,22 @@ async def serve_file_list():
     file_list = get_files_with_sha256(local_folder)
     return file_list
 
+@router.get("/latest_version/{device_id}")
+async def get_latest_firmware_version_for_device(device_id: str):
+    path = os.path.join(Config.FIRMWARE_FOLDER, device_id)
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"Device Id: {device_id}, existiert nicht")
+
+    firmware_versions = os.listdir(path)
+
+    if not firmware_versions:
+        raise HTTPException(status_code=404, detail=f"Keine Version für Geräte mit Device Id: {device_id} gefunden")
+
+    latest_version = max(firmware_versions)
+
+    return latest_version 
+
 # TODO: could be a potential security issue
 '''
 @router.post("/sync_files")
