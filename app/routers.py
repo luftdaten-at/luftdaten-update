@@ -5,31 +5,30 @@ import os
 from typing import List
 
 from utils import calculate_sha256, FileEntry, get_files_with_sha256
+from config import Config
 
 router = APIRouter()
 
-# Dateipfad zum Hauptverzeichnis auf dem Server
-main_py_url = "."
-
-
 @router.get("/download/{filename}")
 async def serve_file(filename: str):
-    file_path = os.path.join(main_py_url, filename)
+    file_path = os.path.join(Config.FIRMWARE_FOLDER, filename)
 
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Datei nicht gefunden")
 
     sha256_checksum = calculate_sha256(file_path)
-    headers = {'X-MD5-Checksum': sha256_checksum}
+    headers = {'sha256_checksum': sha256_checksum}
 
     return FileResponse(file_path, filename=filename, headers=headers)
 
 @router.get("/file_list", response_model=List[FileEntry])
 async def serve_file_list():
-    local_folder = "."
+    local_folder = Config.FIRMWARE_FOLDER
     file_list = get_files_with_sha256(local_folder)
     return file_list
 
+# TODO: could be a potential security issue
+'''
 @router.post("/sync_files")
 async def sync_files(request: Request, x_filename: str = Header(None)):
     file_data = await request.body()
@@ -50,3 +49,4 @@ async def sync_files(request: Request, x_filename: str = Header(None)):
         raise HTTPException(status_code=500, detail=f"Fehler beim Speichern der Datei auf dem Server: {e}")
 
     return received_md5_checksum
+'''
