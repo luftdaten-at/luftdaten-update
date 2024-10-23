@@ -4,7 +4,7 @@ import hashlib
 import os
 from typing import List
 
-from utils import calculate_sha256, FileEntry, get_files_with_sha256
+from utils import calculate_sha256, FileEntry, get_files_with_sha256, get_folders, FolderEntry
 from config import Config
 
 router = APIRouter()
@@ -21,23 +21,37 @@ async def serve_file(filename: str):
 
     return FileResponse(file_path, filename=filename, headers=headers)
 
-@router.get("/file_list", response_model=List[FileEntry])
-async def serve_file_list():
-    local_folder = Config.FIRMWARE_FOLDER
+@router.get("/file_list/{folder}", response_model=List[FileEntry])
+async def serve_file_list(folder: str):
+    local_folder = os.path.join(Config.FIRMWARE_FOLDER, folder)
+
+    if not os.path.exists(local_folder):
+        raise HTTPException(status_code=404, detail="Ordner nicht gefunden")        
+
     file_list = get_files_with_sha256(local_folder)
     return file_list
 
-@router.get("/latest_version/{device_id}")
-async def get_latest_firmware_version_for_device(device_id: str):
+@router.get("/folder_list/{folder}", response_model=List[FolderEntry])
+async def serve_folder_list(folder: str):
+    local_folder = os.path.join(Config.FIRMWARE_FOLDER, folder)
+
+    if not os.path.exists(local_folder):
+        raise HTTPException(status_code=404, detail="Ordner nicht gefunden")        
+
+    file_list = get_folders(local_folder)
+    return file_list
+
+@router.get("/latest_version/{model_id}")
+async def get_latest_firmware_version_for_device(model_id: str):
     path = os.path.join(Config.FIRMWARE_FOLDER)
 
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=f"Device Id: {device_id}, existiert nicht")
+        raise HTTPException(status_code=404, detail=f"Device Id: {model_id}, existiert nicht")
 
-    firmware_versions = [f for f in os.listdir(path) if f.split('_')[0] == device_id]
+    firmware_versions = [f for f in os.listdir(path) if f.split('_')[0] == model_id]
 
     if not firmware_versions:
-        raise HTTPException(status_code=404, detail=f"Keine Version für Geräte mit Device Id: {device_id} gefunden")
+        raise HTTPException(status_code=404, detail=f"Keine Version für Geräte mit Device Id: {model_id} gefunden")
 
     latest_version = max(firmware_versions)
 

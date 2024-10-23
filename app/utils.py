@@ -15,6 +15,9 @@ class FileEntry(BaseModel):
     sha256_checksum: str
     last_update: str
 
+class FolderEntry(BaseModel):
+    relative_path: str
+    
 def get_files_with_sha256(folder):
     file_list = []
     for root, dirs, files in os.walk(folder):
@@ -31,3 +34,19 @@ def get_files_with_sha256(folder):
             )
             file_list.append(file_entry)
     return file_list
+
+def get_folders(folder):
+    folders = []
+    for root, dirs, files in os.walk(folder):
+        for name in dirs:
+            filepath = os.path.join(root, name)
+            #sha256_checksum = calculate_sha256(filepath)
+            #last_update = datetime.datetime.fromtimestamp(os.path.getmtime(filepath))
+            #last_update_str = last_update.strftime('%Y-%m-%d %H:%M:%S')
+            relative_path = os.path.relpath(filepath, folder).replace('\\', '/')
+            folder_entry = FolderEntry(
+                relative_path=relative_path,
+            )
+            folders.append(folder_entry)
+
+    return folders
