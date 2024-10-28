@@ -10,7 +10,7 @@ from dirTree import FolderEntry
 
 router = APIRouter()
 
-@router.get("/download/{filename}")
+@router.get("/download")
 async def serve_file(filename: str):
     file_path = os.path.join(Config.FIRMWARE_FOLDER, filename)
 
