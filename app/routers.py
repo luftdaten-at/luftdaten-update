@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Request, HTTPException, Header
 from fastapi.responses import FileResponse
-import hashlib
 import os
 from typing import List
 
 from utils import calculate_sha256, FileEntry, get_files_with_sha256, get_folders, FolderEntry
 from config import Config
+from dirTree import FolderEntry
+
 
 router = APIRouter()
 
@@ -21,25 +22,16 @@ async def serve_file(filename: str):
 
     return FileResponse(file_path, filename=filename, headers=headers)
 
-@router.get("/file_list/{folder}", response_model=List[FileEntry])
+@router.get("/file_list/{folder}")
 async def serve_file_list(folder: str):
     local_folder = os.path.join(Config.FIRMWARE_FOLDER, folder)
 
     if not os.path.exists(local_folder):
         raise HTTPException(status_code=404, detail="Ordner nicht gefunden")        
 
-    file_list = get_files_with_sha256(local_folder)
-    return file_list
+    folder_entry = FolderEntry(local_folder)
 
-@router.get("/folder_list/{folder}", response_model=List[FolderEntry])
-async def serve_folder_list(folder: str):
-    local_folder = os.path.join(Config.FIRMWARE_FOLDER, folder)
-
-    if not os.path.exists(local_folder):
-        raise HTTPException(status_code=404, detail="Ordner nicht gefunden")        
-
-    file_list = get_folders(local_folder)
-    return file_list
+    return folder_entry.to_dict()
 
 @router.get("/latest_version/{model_id}")
 async def get_latest_firmware_version_for_device(model_id: str):
