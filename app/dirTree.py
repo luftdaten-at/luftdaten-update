@@ -14,12 +14,13 @@ def join_path(path: str, *paths):
     same as os.path.join
     '''
     for p in paths:
+        if p.startswith('./'):
+            p = p[2:]
         if path == "":
             path = p
-        elif path.endswith('/'):
-            path += p
-        else:
-            path += '/' + p
+        if not path.endswith('/'):
+            path += '/'
+        path += p
     return path
 
 def basename(path):
@@ -56,6 +57,9 @@ class Entry:
     def to_dict(self):
         pass
 
+    def remove(self):
+        os.remove(self.path)
+
     def move(self, target_path):
         pass
 
@@ -81,14 +85,21 @@ class FileEntry(Entry):
             'md5_checksum': self.md5_checksum
         }
     
-    def move(self, target_path):
+    def move(self, target_path: str, mode = 'move'):
         target_path = join_path(target_path, basename(self.path))
         with open(self.path, 'rb') as srcf:
             with open(target_path, 'wb') as dstf:
                 while (chunk := srcf.read(CHUNK_SIZE)):
                     dstf.write(chunk)
-        os.remove(self.path)
+        if mode == 'move':
+            os.remove(self.path)
         self.path = target_path
+    
+    def copy(self, target_path: str):
+        self.move(
+            target_path=target_path,
+            mode = 'copy'
+        )
 
     def __str__(self) -> str:
         return f"File: {self.path}, md5_checksum: {self.md5_checksum}"
@@ -149,8 +160,14 @@ class FolderEntry(Entry):
             if isinstance(child, FolderEntry):
                 child.drop(ignore=ignore)
         self.calc_md5_checksum()
+    
+    def remove(self, remove_self = True):
+        for child in self.childs:
+            child.remove()
+        if remove_self:
+            os.rmdir(self.path)
 
-    def move(self, target_path: str, move_self = True):
+    def move(self, target_path: str, move_self = True, mode = 'move'):
         target_path = join_path(target_path, basename(self.path)) if move_self else target_path
         try:
             os.mkdir(target_path)
@@ -158,11 +175,19 @@ class FolderEntry(Entry):
             pass
             
         for child in self.childs:
-            child.move(target_path)
-        os.rmdir(self.path)
+            child.move(target_path, mode = mode)
+        if mode == 'move':
+            os.rmdir(self.path)
 
         self.path = target_path
         self.calc_md5_checksum()
+    
+    def copy(self, target_path: str, copy_self = True):
+        self.move(
+            target_path=target_path,
+            move_self=copy_self,
+            mode='copy'
+        )
     
     def move_diff(self, o, target_path: str, move_self = True):
         '''

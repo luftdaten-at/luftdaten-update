@@ -1,8 +1,10 @@
-from wifi_client import WifiUtil
-from config import Config
-import storage
-from dirTree import FolderEntry, Entry, walk
+from dirTree import FolderEntry, Entry, walk, join_path, FileEntry
 import json
+import storage
+import os
+
+WifiUtil = None
+Config = None
 
 class Ugm:
     # API commands
@@ -10,10 +12,17 @@ class Ugm:
     DOWNLOAD = 'download'
     FILE_LIST = 'file_list'
     IGNORE_FILE_PATH = 'ugm/.ignore'
-    session = WifiUtil.new_session()
+    BACKUP_FOLDER = 'ugm/backup'
+    session = None
+
+    @staticmethod
+    def init(wifiUtil, config):
+        WifiUtil = wifiUtil
+        Config = config
 
     @staticmethod
     def get(url: str, error_msg = ''):
+        Ugm.session = WifiUtil.new_session() 
         try:
             response = Ugm.session.request(
                 method='GET',
@@ -48,57 +57,6 @@ class Ugm:
         return text[1:-1]
 
     @staticmethod
-    def install_update(file_path: str):
-        # unzip file
-        # List the information from a .zip archive
-
-        # replace files
-        pass
-
-    @staticmethod
-    def download_firmware(folder: str):
-        # .ignore
-        ignore = set()
-        try:
-            with open(Ugm.IGNORE_FILE_PATH, 'r') as f:
-                ignore = set(f.read().split())
-        except FileNotFoundError:
-            return False
-
-        # init session
-        session = WifiUtil.new_session()
-
-        # TODO: include igonre
-        cur_tree = FolderEntry('.', ignore=ignore)
-
-        url=f'{Config.settings['UPDATE_SERVER']}/{Ugm.FILE_LIST}/{folder}'
-        text = ''
-        if not (text := Ugm.get(url)):
-            return False
-
-        new_tree = Entry.from_dict(json.loads(text))
-
-        print('cur_tree')
-        for e in walk(cur_tree):
-            print(e.path)
-
-        cur_tree.drop(ignore)
-        new_tree.drop(ignore)
-
-        storage.remount('/', False)
-        cur_tree.move_diff(new_tree, 'ugm', move_self = False)
-        update_tree = new_tree - cur_tree
-
-        print("update_tree")
-        for e in walk(update_tree):
-            print(e.path) 
-
-        # set update flag start
-        # download update_tree
-        # set update flag finish
-        storage.remount('/', True)
-
-    @staticmethod
     def check_if_upgrade_available() -> str:
         '''
         Gets the latest version number
@@ -108,7 +66,7 @@ class Ugm:
         file_name = Ugm.get_latest_firmware_version()
 
         if file_name is None:
-            return 
+            return False
 
         # {MODEL_ID}_{FIRMWARE_MAJOR}_{FIRMWARE_MINOR}_{FIRMWARE_PATCH}
         latest_version = file_name
@@ -133,3 +91,63 @@ class Ugm:
 
             # no upgrade done
             return False
+    
+    @staticmethod
+    def install_update(folder: str):
+        # .ignore
+        ignore = set()
+        try:
+            with open(Ugm.IGNORE_FILE_PATH, 'r') as f:
+                ignore = set(f.read().split())
+        except FileNotFoundError:
+            return False
+
+        # list current dir
+        cur_ignore = set(join_path('.', x) for x in ignore)
+        cur_tree = FolderEntry('.', ignore=cur_ignore)
+
+        url=f'{Config.settings['UPDATE_SERVER']}/{Ugm.FILE_LIST}/{folder}'
+        text = ''
+        if not (text := Ugm.get(url)):
+            return False
+
+        new_tree = Entry.from_dict(json.loads(text))
+        new_ignore = set(join_path(new_tree.path, x) for x in ignore)
+        new_tree.drop(new_ignore)
+
+        update_tree = new_tree - cur_tree
+
+        storage.remount('/', False)
+
+        # clear backup folder
+        FolderEntry(Ugm.BACKUP_FOLDER).remove(remove_self = False)
+
+        # backup diff
+        cur_tree.move_diff(new_tree, Ugm.BACKUP_FOLDER, move_self = False)
+
+        storage.remount('/', True)
+
+        # overwrite with new files
+        Config.settings['ROLLBACK'] = True
+
+        storage.remount('/', False)
+
+        for entry in walk(update_tree):
+            print('update', entry.path)
+            if isinstance(entry, FolderEntry):
+                os.mkdir(entry.path)
+            if isinstance(entry, FileEntry):
+                # download file
+                url=f'{Config.settings['UPDATE_SERVER']}/{Ugm.DOWNLOAD}?{entry.path}'
+                content = Ugm.get()
+                with open(entry.path, 'w') as f:
+                 f.write(content)
+
+        storage.remount('/', True)
+
+        Config.settings['ROLLBACK'] = False
+
+
+    @staticmethod
+    def rollback():
+        pass

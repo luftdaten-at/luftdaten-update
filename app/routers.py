@@ -29,7 +29,10 @@ async def serve_file_list(folder: str):
     if not os.path.exists(local_folder):
         raise HTTPException(status_code=404, detail="Ordner nicht gefunden")        
 
-    folder_entry = FolderEntry(local_folder)
+    cur_wd = os.getcwd()
+    os.chdir(local_folder)
+    folder_entry = FolderEntry('.')
+    os.chdir(cur_wd)
 
     return folder_entry.to_dict()
 
