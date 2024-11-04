@@ -1,7 +1,10 @@
-from dirTree import FolderEntry, Entry, walk, join_path, FileEntry
 import json
 import storage
 import os
+from ssl import create_default_context
+from adafruit_requests import Session
+
+from dirTree import FolderEntry, Entry, walk, join_path, FileEntry
 from logger import logger
 
 WifiUtil = None
@@ -14,7 +17,6 @@ class Ugm:
     FILE_LIST = 'file_list'
     IGNORE_FILE_PATH = 'ugm/.ignore'
     BACKUP_FOLDER = 'ugm/backup'
-    session = None
 
     @staticmethod
     def init(wifiUtil, config):
@@ -22,24 +24,11 @@ class Ugm:
         WifiUtil = wifiUtil
         Config = config
 
+
     @staticmethod
     def get(url: str):
-        Ugm.session = WifiUtil.new_session() 
-        try:
-            response = Ugm.session.request(
-                method='GET',
-                url=url
-            )
-            if response.status_code != 200:
-                logger.error(f'GET failed, url: {url}, status code: {response.status_code}, text: {response.text}')
+        return WifiUtil.get(url)
 
-                return False
-
-            return response.text
-
-        except Exception as e:
-            logger.error(f'GET faild: {e}')
-            return False
 
     @staticmethod
     def get_latest_firmware_version() -> str:

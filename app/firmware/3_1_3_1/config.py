@@ -51,6 +51,7 @@ class Config:
         'API_URL': 'boot.toml',
         'TEST_API_URL': 'boot.toml',
         'UPDATE_SERVER': 'boot.toml',
+        'SEND_TO_SENSOR_COMMUNITY': 'settings.toml',
 
         # AirStationConfig must not be specified in settings.toml
         'longitude': 'settings.toml',
@@ -58,7 +59,9 @@ class Config:
         'height': 'settings.toml',
         'auto_update_mode': 'settings.toml',
         'battery_save_mode': 'settings.toml',
-        'measurement_interval': 'settings.toml', 
+        'measurement_interval': 'settings.toml',
+
+        'CERTIFICATE_PATH': 'boot.toml',
     }
     # Normal settings (persistent)
     settings = AutoSaveDict({
@@ -89,6 +92,7 @@ class Config:
         'API_URL': None,
         'TEST_API_URL': None,
         'UPDATE_SERVER': None,
+        'SEND_TO_SENSOR_COMMUNITY': None,
 
         # AirStationConfig must not be specified in settings.toml
         'longitude': "",
@@ -97,6 +101,8 @@ class Config:
         'auto_update_mode': AutoUpdateMode.on,
         'battery_save_mode': BatterySaverMode.off,
         'measurement_interval': AirStationMeasurementInterval.sec30,
+
+        'CERTIFICATE_PATH': 'certs/isrgrootx1.pem',
     }, toml_file=key_to_toml_file)
 
     # Runtime settings (non-persistent)
@@ -105,6 +111,8 @@ class Config:
         'JSON_QUEUE': 'json_queue',
         'FIRMWARE_FOLDER': 'new_firmware',
         'CERTIFICATE_PATH': 'certs/isrgrootx1.pem',
+        'SENSOR_COMMUNITY_CERTIFICATE_PATH': 'certs/api-sensor-community-chain.pem',
+        'SENSOR_COMMUNITY_API': 'https://api.sensor.community/v1/push-sensor-data',
         'API_KEY_LENGTH': 32,
     }
 
