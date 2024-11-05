@@ -19,7 +19,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-.lib/
+lib/
 lib64/
 parts/
 sdist/
@@ -155,3 +155,5 @@ cython_debug/
 
 # docker compose production environment
 docker-compose.prod.yml
+
+!.app/firmware
