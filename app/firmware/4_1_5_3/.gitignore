@@ -1,0 +1,8 @@
+# ignore all . files and . folders
+.*
+
+# except for .gitignore
+!.gitignore
+
+# Circuitpython
+boot_out.txt
