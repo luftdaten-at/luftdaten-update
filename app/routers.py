@@ -20,7 +20,7 @@ async def serve_file(filename: str):
     sha256_checksum = calculate_sha256(file_path)
     headers = {'sha256_checksum': sha256_checksum}
 
-    return FileResponse(file_path, filename=filename, headers=headers)
+    return FileResponse(file_path, filename=filename, headers=headers, media_type="application/octet-stream")
 
 @router.get("/file_list/{folder}")
 async def serve_file_list(folder: str):
