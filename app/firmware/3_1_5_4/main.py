@@ -24,7 +24,7 @@ from util import get_battery_monitor, get_connected_sensors, get_model_id_from_s
 def main():
     # hack a little bit
     storage.remount('/', False)
-    with open('ugm/ignore', 'w') as f:
+    with open('ugm/.ignore', 'w') as f:
         print('''settings.toml
     ugm/backup''', file=f)
     storage.remount('/', True)
