@@ -26,7 +26,7 @@ def main():
     storage.remount('/', False)
     with open('ugm/.ignore', 'w') as f:
         print('''settings.toml
-    ugm/backup''', file=f)
+ugm/backup''', file=f)
     storage.remount('/', True)
 
     logger.debug('loaded main.py')
