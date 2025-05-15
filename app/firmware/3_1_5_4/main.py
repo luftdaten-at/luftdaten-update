@@ -8,6 +8,7 @@ import traceback
 import supervisor
 import adafruit_ds3231
 import rtc
+import storage
 from ld_service import LdService
 from adafruit_ble import BLERadio  # type: ignore
 from adafruit_ble.advertising.standard import ProvideServicesAdvertisement  # type: ignore
@@ -21,6 +22,13 @@ from logger import logger
 from util import get_battery_monitor, get_connected_sensors, get_model_id_from_sensors
 
 def main():
+    # hack a little bit
+    storage.remount('/', False)
+    with open('ugm/ignore', 'w') as f:
+        print('''settings.toml
+    ugm/backup''', file=f)
+    storage.remount('/', True)
+
     logger.debug('loaded main.py')
     # simple lighting at initialization
     led = neopixel.NeoPixel(board.IO8, 1)

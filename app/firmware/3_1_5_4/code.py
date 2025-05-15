@@ -1,17 +1,9 @@
 import supervisor
 import board
 import neopixel
-import storage
 from ugm.upgrade_mananger import Ugm
 from ugm.upgrade_manager_util import Config, WifiUtil
 from logger import logger
-
-# hack a little bit
-storage.remount('/', False)
-with open('ugm/ignore', 'w') as f:
-    print('''settings.toml
-ugm/backup''', file=f)
-storage.remount('/', True)
 
 
 Config.init(only_settings=True)
