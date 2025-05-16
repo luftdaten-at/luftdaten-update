@@ -77,6 +77,8 @@ class LdProductModel:
                 "model": Config.settings['MODEL'],
                 "apikey": Config.settings['api_key'],
                 "source": 1,
+                "test_mode": Config.settings['TEST_MODE'],
+                "calibration_mode": Config.settings['CALIBRATION_MODE']
             },
             "sensors": {}
         }
@@ -141,7 +143,23 @@ class LdProductModel:
         )
         if response.status_code == 200:
             logger.log_list.clear()
-
+            # updaet flags if they exist
+            j = response.json()
+            if 'flags' in j:
+                test_mode = j['flags'].get('test_mode')
+                calibration_mode = j['flags'].get('calibration_mode')
+                changed_config = False
+                if Config.settings['TEST_MODE'] != test_mode:
+                    Config.settings['TEST_MODE'] = test_mode
+                    changed_config = True
+                if Config.settings['CALIBRATION_MODE'] != calibration_mode:
+                    Config.settings['CALIBRATION_MODE'] = calibration_mode
+                    changed_config = True
+                # restart if flags have changed
+                if changed_config:
+                    logger.info('Changed flags restart now')
+                    import supervisor
+                    supervisor.reload()
 
     def read_all_sensors(self):
         for sensor in self.sensors:

@@ -1,11 +1,15 @@
 import board
 import neopixel
+import time
+import json
 
 from led_controller import LedController
 from models.ld_product_model import LdProductModel
 from led_controller import RepeatMode
 from enums import Color, BleCommands
 from logger import logger
+from config import Config
+from wifi_client import WifiUtil
 
 class AirAround(LdProductModel): 
     NEOPIXEL_PIN = board.IO8
@@ -20,6 +24,8 @@ class AirAround(LdProductModel):
         self.model_id = model
         self.ble_on = True
 
+        self.last_measurement = None
+
         # init status led
         self.status_led = LedController(
             status_led=neopixel.NeoPixel(
@@ -28,7 +34,8 @@ class AirAround(LdProductModel):
             ),
             n=AirAround.NEOPIXLE_N
         )
-        
+
+
     def receive_command(self, command):
         if not command:
             return
@@ -47,20 +54,49 @@ class AirAround(LdProductModel):
             self.update_ble_battery_status()
             logger.debug("Battery status updated")
     
+    # The following methods do not need to be overridden by subclasses.
+    def update_ble_sensor_data(self):
+        """Read out sensors values and update BLE characteristic."""
+        vals_array = bytearray()
+        for sensor in self.sensors:
+            try:
+                sensor.read()
+            except:
+                logger.error(f"Error reading sensor {sensor.model_id}, using previous values")
+            vals_array.extend(sensor.get_current_values())
+
+        print(f'[{json.dumps(self.get_json())}, {list(vals_array)}]'.encode('utf-8'))
+        #self.ble_service.sensor_values_characteristic = vals_array
+        self.ble_service.sensor_values_characteristic = f'[{json.dumps(self.get_json())}, {list(vals_array)}]'.encode('utf-8')
+    
     def receive_button_press(self):
         pass
     
-    def tick(self):
-        pass
+    def tick(self): 
+        if self.last_measurement is None or time.monotonic() - self.last_measurement >= Config.settings['measurement_interval']:
+            # set last measurement to now
+            self.last_measurement = time.monotonic()
+
+            # send to API
+            data = self.get_json()
+            self.save_data(data=data)
+            if WifiUtil.radio.connected:
+                self.send_to_api()
+
+    def get_info(self):
+        device_info = super().get_info()
+        device_info['station']['battery'] = {
+            "voltage": self.battery_monitor.cell_voltage() if self.battery_monitor else None,
+            "percentage": self.battery_monitor.cell_soc() if self.battery_monitor else None,
+        }
+
+        return device_info
 
     def connection_update(self, connected):
         if connected:
             self.status_led.show_led({
-                'repeat_mode': RepeatMode.FOREVER,
-                'elements': [
-                    {'color': Color.GREEN, 'duration': 0.5},
-                    {'color': Color.OFF, 'duration': 0.5},
-                ],
+                'repeat_mode': RepeatMode.PERMANENT,
+                'color': Color.GREEN_LOW,
             })
         else:
             self.status_led.show_led({
