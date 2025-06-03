@@ -32,19 +32,6 @@ def main():
 
     Ugm.init(WifiUtil, Config)
 
-    # perforem ugm2 update mostly for upgrading ugm
-    # check if update available
-    if WifiUtil.radio.connected and (folder := Ugm.check_if_upgrade_available()):
-        # Assume model is AirStation
-        status_led = neopixel.NeoPixel(board.IO8, 1)
-        status_led[0] = (200, 0, 80)
-        logger.debug(f'Installing new firmware from folder: {folder}')
-        try:
-            Ugm.install_update(folder)
-        except Exception as e:
-            logger.critical(f'Upgrade failed: {e}')
-            supervisor.reload()
-
     # init bus
     i2c = busio.I2C(scl=board.IO5, sda=board.IO4, frequency=20000)
 
@@ -198,11 +185,26 @@ def main():
         if not WifiUtil.radio.connected:
             WifiUtil.connect()
 
+        '''
         # Check for updates
         if WifiUtil.radio.connected:
             if Ugm.check_if_upgrade_available():
                 logger.info('Upgrade available, reload to install')
                 supervisor.set_next_code_file('code.py')
+                supervisor.reload()
+        '''
+
+        # perforem ugm2 update mostly for upgrading ugm
+        # check if update available
+        if WifiUtil.radio.connected and (folder := Ugm.check_if_upgrade_available()):
+            # Assume model is AirStation
+            status_led = neopixel.NeoPixel(board.IO8, 1)
+            status_led[0] = (200, 0, 80)
+            logger.debug(f'Installing new firmware from folder: {folder}')
+            try:
+                Ugm.install_update(folder)
+            except Exception as e:
+                logger.critical(f'Upgrade failed: {e}')
                 supervisor.reload()
 
         if not ble.advertising and device.ble_on:
