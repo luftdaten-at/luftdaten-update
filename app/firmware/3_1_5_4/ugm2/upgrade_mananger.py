@@ -15,8 +15,8 @@ class Ugm:
     LATEST_VERSION = 'latest_version'
     DOWNLOAD = 'download'
     FILE_LIST = 'file_list'
-    IGNORE_FILE_PATH = 'ugm/.ignore'
-    BACKUP_FOLDER = 'ugm/backup'
+    IGNORE_FILE_PATH = 'ugm2/.ignore'
+    BACKUP_FOLDER = 'ugm2/backup'
 
     @staticmethod
     def init(wifiUtil, config):
