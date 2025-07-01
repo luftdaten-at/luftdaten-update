@@ -43,12 +43,12 @@ async def get_latest_firmware_version_for_device(model_id: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"Device Id: {model_id}, existiert nicht")
 
-    firmware_versions = [f for f in os.listdir(path) if f.split('_')[0] == model_id]
+    firmware_versions = [tuple(int(x) for x in f.split('_')) for f in os.listdir(path) if f.split('_')[0] == model_id]
 
     if not firmware_versions:
         raise HTTPException(status_code=404, detail=f"Keine Version für Geräte mit Device Id: {model_id} gefunden")
 
-    latest_version = max(firmware_versions)
+    latest_version = '_'.join([str(x) for x in max(firmware_versions)])
 
     return latest_version
 
