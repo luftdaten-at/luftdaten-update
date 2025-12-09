@@ -26,6 +26,10 @@ COPY ./requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the FastAPI application code into the container
-#COPY ./app .
+COPY ./app ./app
 
-CMD ["python", "main.py"]
+# Copy tests into the container
+COPY ./tests ./tests
+COPY ./pytest.ini ./pytest.ini
+
+CMD ["python", "app/main.py"]

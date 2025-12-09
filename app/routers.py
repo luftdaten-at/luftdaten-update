@@ -14,7 +14,7 @@ router = APIRouter()
 async def serve_file(filename: str):
     file_path = os.path.join(Config.FIRMWARE_FOLDER, filename)
 
-    if not os.path.exists(file_path):
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="Datei nicht gefunden")
 
     sha256_checksum = calculate_sha256(file_path)
