@@ -1,0 +1,360 @@
+# 1. Installieren
+
+## 1 - CircuitPython-Version herunterladen
+
+Download-Link: https://circuitpython.org/board/espressif_esp32s3_devkitc_1_n8r8/
+
+Für BLE auf dem ESP32-S3 wird mindestens CircuitPython 9.1.0 benötigt. Durch einen Bug in Circuitpython kann aktuell nur <= 9.1.0 oder >= 9.2.0 genutzt werden. Lade die `.bin`-Datei herunter.
+
+## 2 - CircuitPython auf dem ESP32-S3 installieren
+
+Verbinde Mac und ESP32 per USB C. Installiere, falls noch nicht vorhanden, esptool.py:
+
+```bash
+pip3 install esptool
+```
+
+Find den Port des ESP32:
+
+```bash
+ls /dev/tty.*
+```
+
+Der ESP32 sollte als USB-Gerät angezeigt werden, z.B. `/dev/tty.usbmodem101`.
+
+Lösche den Flash-Speicher des ESP32:
+
+```bash
+esptool.py --port /dev/tty.usbmodem101 erase_flash
+```
+
+Flashe CircuitPython auf den ESP32:
+
+```bash
+esptool.py --port /dev/tty.usbmodem101 write_flash -z 0x0 circuitpython.bin
+```
+
+wobei `circuitpython.bin` der Pfad zur heruntergeladenen CircuitPython-Datei ist.
+
+## 3 - CircuitPython-Bibliotheken installieren
+
+Nach einem eventuellen Neustart des ESP32 sollte ein neues Laufwerk namens `CIRCUITPY` erscheinen. Kopiere den Inhalt dieses Ordners ohne diese Datei und `.gitignore` in den Ordner. Installiere, falls notwendig, `circup` auf dem Mac:
+
+```bash
+pip3 install circup
+circup bundle-add good-enough-technology/circuitpython_goodenough_bundle
+```
+
+Führe nun Circup aus, um die benötigten Bibliotheken zu installieren:
+
+```bash
+circup install --auto
+```
+
+Für **Air Station im Wifiless-Modus** (Messdaten auf SD-Karte) zusätzlich:
+
+```bash
+circup install adafruit_sdcard
+```
+
+**Home Assistant / MQTT (optional):** Die Firmware enthält **Adafruit MiniMQTT 7.2.0** unter `lib/adafruit_minimqtt/`. Zum Aktualisieren alternativ `circup install adafruit_minimqtt` (beachte ggf. neuere Abhängigkeiten wie `adafruit_connection_manager`). Siehe [`docs/mqtt-home-assistant.md`](../docs/mqtt-home-assistant.md).
+
+Drücke den Reset-Knopf am ESP32, um die Installation abzuschließen.
+
+## 4 - Gerät konfigurieren
+
+Öffne die `settings.toml`-Datei im `CIRCUITPY`-Laufwerk und passe die Konfiguration an. Setze **`MODEL`** auf die gewünschte Geräte-ID (`1` … `5`, vgl. Tabelle und `enums.py`). **`MODEL = -1`** löst weiterhin beim Start eine **Sensor-basierte Auto-Erkennung** aus (wird nach dem Scan in `settings.toml` persistiert). Neu: dieselbe Erkennung kann einmalig über **`DETECT_MODEL_FROM_SENSORS`** in **`startup.toml`** ausgelöst werden (siehe unten).
+
+| ID | Modelname |
+| --- | --- |
+| -1 | Autoerkennung beim nächsten Start (legacy; alternativ Flag in `startup.toml`) |
+| 1 | Air aRound |
+| 2 | Air Cube |
+| 3 | Air Station |
+| 4 | Air Badge |
+| 5 | Air Bike |
+
+### `startup.toml` (Einmal-Aktionen beim Start)
+
+Neben `settings.toml` gibt es **`startup.toml`** im Firmware-Root (wird mit auf `CIRCUITPY` kopiert). Darin stehen **Booleans für einmalige Aktionen**: Flag auf `true` setzen, Gerät neu starten; **nach erfolgreicher Ausführung setzt die Firmware das Flag wieder auf `false`**. Bei Fehler bleibt das Flag `true` für einen erneuten Versuch.
+
+### `sensors.toml` (Sensor-Scan-Snapshot)
+
+Die Firmware legt beim Start **`sensors.toml`** auf dem CIRCUITPY-Root an bzw. überschreibt sie (**Zeitpunkt**, **Battery-Monitor ja/nein**, **Liste der gefundenen Sensor-Modell-IDs** als Zahlen). Die Datei gehört nicht zu `settings.toml`/`Config`. Weicht der aktuelle I²C-Scan vom zuletzt gespeicherten Snapshot ab, wird der Scan **einmal** wiederholt. Details: [`docs/settings.md`](../docs/settings.md).
+
+- **`SYNC_RTC_FROM_NTP`**: Wenn `true` und in `settings.toml` **SSID** (und ggf. Passwort) gesetzt sind: einmalig **WLAN verbinden**, Zeit per **NTP** holen, **CircuitPython-RTC** und ggf. **DS3231** setzen (wie bei `WifiUtil.set_RTC()`), danach Flag löschen. Nützlich z. B. für **Wifiless**-Stationen, die sonst nie verbinden.
+
+- **`DETECT_MODEL_FROM_SENSORS`**: Wenn `true`: nach dem **I2C-Sensor-Scan** wird **`MODEL`** in `settings.toml` aus der Hardware abgeleitet, **`set_api_url()`** aufgerufen, danach wird das Flag wieder **`false`**. **Übergang:** **`MODEL == -1`** in `settings.toml` löst dieselbe Erkennung weiterhin aus (wie bisher). Zusätzlich kann man mit diesem Flag **einmalig neu erkennen**, auch wenn **`MODEL`** schon eine konkrete ID hat (überschreibt `MODEL`).
+
+- **`UPLOAD_SD_LOG_TO_DATAHUB`**: Nur **Air Station mit `WIFILESS_MODE`**: nach dem Sensor-Scan **WLAN** (SSID in `settings.toml`) verbinden, Datei **`SD_LOG_PATH`** (Standard `/sd/measurements.jsonl`) **Zeile für Zeile** als Mess-JSON an die **Datahub-`data/`-API** senden. **Voller Erfolg** (HTTP 200/422 pro Zeile): Logdatei **leeren**, Flag **`false`**. **Teilfehler** oder kein WLAN: Datei unverändert, Flag bleibt **`true`** (erneuter Versuch nach Fix). Leere/fehlende Datei: Flag wird gelöscht (nichts zu tun). Jede **HTTP-Antwort** (Status + gekürzter Body) wird zusätzlich in **`/datahub_upload.log`** auf dem CIRCUITPY-Root angehängt.
+
+- **`CLEAR_SD_CARD`**: Nur **Air Station mit `WIFILESS_MODE`**: nach dem Sensor-Scan und **nach** `UPLOAD_SD_LOG_TO_DATAHUB` (falls aktiv) werden **alle Dateien und Ordner unter `/sd`** gelöscht (kein WLAN nötig). Bei **Erfolg** wird das Flag **`false`**. Bei Fehler (z. B. SD nicht mountbar) bleibt **`true`**. **Vorsicht:** alles auf der SD-Karte im Wurzelverzeichnis geht verloren.
+
+- **`REFRESH_SENSORS`**: Wenn **`true`**: nach dem üblichen I²C‑Sensor‑Probe (inkl. ggf. Wiederholung bei Abweichung von `sensors.toml`) läuft **noch einmal** `get_connected_sensors` + `get_battery_monitor`; danach wird **`sensors.toml`** geschrieben (wie bei jedem Boot) und das Flag nach **erfolgreichem Schreiben** gelöscht. Bei Schreibfehler bleibt **`true`** für einen späteren Versuch.
+
+Wi‑Fi-Zugangsdaten bleiben ausschließlich in **`settings.toml`**.
+
+
+## 5 - Gerät initialisieren
+
+Starte das Gerät neu, während du den Button gedrückt hältst. Passe dabei auf, den Button über das Ende der türkisen LED-Phase hinaus gedrückt zu halten. Die LED zeigt nun Violett an und initialisiert sich. Achtung: Während der Initialisierung darf das Gerät nicht über USB verbunden sein.
+
+
+# 2. BLE-Protokoll (v2)
+
+## Service
+
+UUID: `0931b4b5-2917-4a8d-9e72-23103c09ac29`
+
+
+### Befehle / Auslesen neuer Sensordaten anfragen (neu in v2)
+
+Characteristic UUID: `030ff8b1-1e45-4ae6-bf36-3bca4c38cdba` (write)
+
+Schreibe `0x01` um neue Sensordaten auszulesen.
+Schreibe `0x02` um neue Sensordaten auszulesen und den Batteriestatus zu aktualisieren.
+Weitere Befehle hängen von Modell ab (siehe unten).
+
+Byte | Action
+--- | ---
+READ_SENSOR_DATA | 0x01
+READ_SENSOR_DATA_AND_BATTERY_STATUS | 0x02
+UPDATE_BRIGHTNESS | 0x03
+TURN_OFF_STATUS_LIGHT | 0x04
+TURN_ON_STATUS_LIGHT | 0x05
+SET_AIR_STATION_CONFIGURATION | 0x06
+
+### SET_AIR_STATION_CONFIGURATION (TLV)
+
+After command byte **`0x06`**, the payload is a **sequence of TLV records** (not a bitmask):
+
+```text
+[ flag: u8 ][ length: u8 ][ value: length bytes ]  (repeated)
+```
+
+- **Strings** (SSID, password, geo, …): `value` = UTF-8 bytes; `length` = `len(value)`.
+- **Integers** (intervals, modes): `value` = 4-byte **big-endian** signed int32; `length` = `4`.
+
+Canonical spec: [`docs/ble-characteristics.md`](../docs/ble-characteristics.md). Reference packets: `python3 tools/ble_tlv_reference.py`.
+
+## Flags (`flag` byte value, not a bit index)
+
+| Flag (dec) | Configuration            | Description                               |
+|------------|--------------------------|-------------------------------------------|
+| 0          | AUTO_UPDATE_MODE         | int32                                     |
+| 1          | BATTERY_SAVE_MODE        | int32                                     |
+| 2          | MEASUREMENT_INTERVAL     | int32                                     |
+| 3          | LONGITUDE                | UTF-8 string                              |
+| 4          | LATITUDE                 | UTF-8 string                              |
+| 5          | HEIGHT                   | UTF-8 string                              |
+| 6          | SSID                     | UTF-8 string (not in BLE read-back)       |
+| 7          | PASSWORD                 | UTF-8 string (not in BLE read-back)       |
+| 8          | DEVICE_ID                | Read-only on write; included in read TLV  |
+
+## Data Types
+
+- **Integer Values**: Represented as a 4-byte integer in big-endian format (e.g., for measurement intervals).
+- **Strings**: Represented as UTF-8 encoded byte arrays for SSID and password.
+
+### Sensordaten auslesen (gleich wie v1)
+
+Characteristic UUID: `4b439140-73cb-4776-b1f2-8f3711b3bb4f`
+
+Format: `[SENSOR A][SENSOR B]...`
+
+Wert, bevor erste Daten ausgelesen wurden: `0x00`
+
+Für jeden Sensor:
+
+| Byte | Inhalt |
+|---|---|
+| 0 | Sensor-ID |
+| 1 | Anzahl Messdimensionen |
+| >2 | Messdaten |
+
+Für jede Messdimension:
+
+| Byte | Inhalt |
+|---|---|
+| 0 | Messdimensions-ID |
+| 1 | High byte von (Messwert * 10, gerundet) |
+| 2 | Low byte von (Messwert * 10, gerundet) |
+
+Achtung: wenn keine Werte vorhanden sind (sollte eigentlich nicht vorkommen), sende `0x00` für beide Bytes.
+
+Aktuell unterstützte Messdimensionen:
+
+| ID | Messdimension |
+|---|---|
+| 1 | PM0.1 |
+| 2 | PM1.0 |
+| 3 | PM2.5 |
+| 4 | PM4.0 |
+| 5 | PM10.0 |
+| 6 | Luftfeuchtigkeit |
+| 7 | Temperatur |
+| 8 | VOC-Index |
+| 9 | NOx-Index |
+| 10 | Luftdruck |
+| 11 | CO2 |
+| 12 | O3 |
+| 13 | AQI |
+| 14 | Gaswiderstand (für Bosch AQI) |
+| 15 | VOC (absolut) |
+| 16 | NO2 |
+
+Aktuell unterstützte Sensor-IDs:
+
+| ID | Sensor | Messdimensionen |
+|---|---|---|
+| 1 | Sen5x | PM1, PM2.5, PM4, PM10, Temp, Hum, VOC-Index, NOX-Index |
+| 2 | BMP280 | Temp, Druck |
+| 3 | BME280 | Temp, Druck, Hum |
+| 3 | BME680 | Temp, Druck |
+| 4 | SCD4x | Temp, Hum, CO2 |
+| 5 | AHT20 | Temp, Hum |
+| 6 | SHT30 | Temp, Hum |
+| 7 | SHT31 | Temp, Hum |
+| 8 | AGS02MA | VOCs (absolut), Gaswiderstand |
+| 9 | SHT4X | Temp, Hum |
+
+
+### Luftdaten-Gerät-Details auslesen (geändert in v2)
+
+UUID: `8d473240-13cb-1776-b1f2-823711b3ffff`
+
+| Byte | Inhalt | Wert |
+|---|---|---|
+| 0 | Protokoll-Version | 2 |
+| 1 | Firmware Major Version |  |
+| 2 | Firmware Minor Version |  |
+| 3 | Firmware Patch Version |  |
+_Sollten hier noch andere Gerätedetails (Name, Projekt) ausgelesen werden? z.B.:_
+| Byte | Inhalt | Wert |
+|---|---|---|
+| 4-7 | Gerätename (ASCII) | Wenn unbekannt: 0x00 0x00 0x00 0x00 | (Serverseitig noch nicht implementiert, momentan immer 0000)
+| 8 | Modell-ID (Air aRound = 1, Cube = 2, Station = 3) |  |
+_Status der einzelnen erkannten Sensoren_
+| Byte | Inhalt | Wert |
+|---|---|---|
+| 9 | Anzahl konfigurierter Sensoren |  |
+| 10 | Sensor 0: Sensor-ID |  |
+| 11 | Sensor 0: Status | Nicht gefunden: 0x00, Gefunden: 0x01 |
+_... weitere Sensoren_
+
+### Gerätstatus auslesen (neu in v2)
+
+UUID: `77db81d9-9773-49b4-aa17-16a2f93e95f2`
+
+| Byte | Inhalt | Wert |
+|---|---|---|
+| 0 | Hat Batteriestatus | 0: nein, 1: ja |
+| 1 | Batterieladestatus (in %) |  |
+| 2 | Betriebsspannung (in 0.1V) |  |
+| 3 | WLAN-Detail | 0: OK; 0x01: SSID nicht gesetzt; 0x02: SSID nicht gefunden; 0x03: Verbindung fehlgeschlagen (relevant wenn Bit `WIFI_FAILURE` in Byte 4) |
+| 4 | Status-Flags (Bitmask) | 0x01: Konfiguration unvollständig; 0x02: WLAN fehlgeschlagen; 0x04: kein Sensor; 0x08: SSID in settings.toml gesetzt |
+
+Mehrere Bits können gleichzeitig gesetzt sein. Details: [`docs/ble-characteristics.md`](../docs/ble-characteristics.md).
+
+### Sensordetails auslesen (geändert in v2)
+
+UUID: `13fa8751-57af-4597-a0bb-b202f6111ae6`
+
+Wenn keine Sensoren erkannt wurden: sende `0x06`
+
+Wenn Sensoren erkannt wurden: sende `[SENSOR A]0xff[SENSOR B]0xff...` (für nur einen Sensor: `[SENSOR A]0xff`)
+
+Für jeden Sensor:
+
+| Byte | Inhalt |
+|---|---|
+| 0 | Sensor-ID |
+| 1 | Anzahl Messdimensionen |
+| 2-x | IDs der Messdimensionen |
+
+Gefolgt von byte 0xff. Dann optional Sensor-Details, wenn von Sensor unterstützt.
+
+#### SEN5x
+
+| Byte | Inhalt | Wert |
+|---|---|---|
+| 0 | Firmware-Version, major |  |
+| 1 | Firmware-Version, minor |  |
+| 2 | Hardware-Version, major |  |
+| 3 | Hardware-Version, minor |  |
+| 4 | Protokoll-Version, major |  |
+| 5 | Protokoll-Version, minor |  |
+| >6 | Seriennummer, utf8 |  |
+
+#### SHT4x
+
+| Byte | Inhalt | Wert |
+|---|---|---|
+| 0-3 | Seriennummer (32-bit) |  |
+
+#### SHT4x
+
+| Byte | Inhalt | Wert |
+|---|---|---|
+| 0-5 | Seriennummer (6 bytes) |  |
+
+
+# 3. LED-Farbcodes
+
+| Farbe | Bedeutung |
+|---|---|
+| Türkis | Gerät wird gestartet |
+| Blau | Gerät startet im normalen Modus |
+| Grün | Gerät ist betriebsbereit |
+| Violett | Gerät wird initialisiert (u. A. werden verbundene Sensoren gesucht) |
+| Orange | Gerät sendet Statusdaten (passiert nach Initialisierung) |
+| Rot | Fehler |
+
+## AirStation
+| Farbe | Bedeutung |
+|---|---|
+| Rot | Wlan ist nicht verbunden |
+| Lila | Es fehlen Konfigurationen um Daten an die API zu senden |
+
+## Fehler-LED-Codes
+
+| Farbe | Muster (Sek an/Sek aus) | Bedeutung | Lösung |
+|---|---|---|---|
+| Rot | 1/1 | Gerät war bei Initialisierung über USB verbunden | Ausstecken, neu starten |
+| Rot/Orange | 1/1 | Ungültige Modell-ID | Neu initialisieren oder `settings.toml` manuell bearbeiten |
+
+
+# 4. Befehle und Statusdetails nach Gerätemodell
+
+## Air aRound, Air Badge
+_Keine Änderungen gegenüber oben definiertem Standard._
+
+## Air Station
+### Fehlercodes
+- 0x01: Wifi-SSID oder -Passwort nicht gesetzt
+- 0x02: Netzwerk mit dieser SSID nicht gefunden
+- 0x03: Falsches Passwort / Verbindung fehlgeschlagen
+- 0x04: Keine Verbindung zum Internet (pinge z. B. Google)
+- 0x05: Keine Verbindung zum Server
+- 0x06: Server hat Datenpaket abgelehnt
+
+### Status-Flags (Byte 4, alle BLE-Modelle)
+Siehe Tabelle unter „Gerätstatus auslesen“. Bit `0x08` entspricht „Wifi-SSID gesetzt“.
+
+### Zusätzliche Befehle
+- Wifi-SSID und -Passwort setzen: `0x03 [SSID] 0x00 [Passwort] 0x00`
+- Messintervall setzten: `0x04 [Intervall in Sekunden]`
+- Bluetooth ausschalten: `0x05`
+_In Zukunft: z. B. Server-URL, Auto-Update oder Batteriesparmodus setzten._
+
+## Air Cube
+_TBD_
+
+# Color code
+
+yellow, init config
+blue, ble on ready to connect
+green, connected
+
+## AirStation
+...

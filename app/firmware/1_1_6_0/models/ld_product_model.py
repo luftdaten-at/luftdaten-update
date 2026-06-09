@@ -1,0 +1,294 @@
+import storage
+import json
+import os
+import gc
+import time
+
+from enums import LdProduct
+from logger import logger
+from wifi_client import WifiUtil
+from config import Config
+from tz_format import format_iso8601_tz
+from sensors.sensor import Sensor
+
+# Top-level JSON key for device metadata in API/BLE payloads (historically "station").
+API_JSON_DEVICE_KEY = "device"
+
+
+class LdProductModel:
+    def __init__(self, ble_service, sensors: list[Sensor], battery_monitor):
+        self.model_id = None
+        self.measurements = {}
+        """Product model."""
+        
+        self.polling_interval = 0.1
+        """Main loop polling interval in seconds."""
+        
+        self.ble_on = False
+        """Whether to advertise over BLE."""
+        
+        self.number_of_leds = 1
+        """Number of LEDs on the device."""
+        
+        # State injection
+        self.ble_service = ble_service
+        self.sensors = sensors
+        self.battery_monitor = battery_monitor
+        self.status = bytearray([0, 0, 0, 0, 0])
+        self.physical_sensor_count = 0
+        self.last_api_send = None
+        self.api_send_interval = 30 # 30 seconds
+
+        # try to connect to wifi if not connected (wifiless still uses Wi‑Fi when SSID is set, e.g. datahub status)
+        if not WifiUtil.radio.connected:
+            WifiUtil.connect()
+        # Initial device info to datahub whenever Wi‑Fi is up (including Air Station wifiless + SD log).
+        if WifiUtil.radio.connected:
+            data = self.get_initial_info()
+            api_url = Config.settings['DATAHUB_TEST_API_URL'] if Config.settings['TEST_MODE'] else Config.settings['DATAHUB_API_URL']
+            logger.debug('Try to send initial info to datahub')
+            resp = WifiUtil.send_json_to_api(
+                data=data,
+                api_url=api_url,
+            )
+            logger.debug(f'Datahub response: {resp.text}')
+
+
+    def get_initial_info(self):
+        """
+        returns station info json with additional sensor inforation for datahub status
+        """
+        device_info = self.get_info()
+        # add list of all connected sensors
+        device_info[API_JSON_DEVICE_KEY]['sensor_list'] = [
+            {
+                "model_id": sensor.model_id,
+                "dimension_list": sensor.measures_values,
+                "serial_number": sensor.get_serial_number()
+            } for sensor in self.sensors
+        ]
+
+        return device_info
+    
+    def get_info(self):
+        """returns json with device info for api"""
+        formatted_time = format_iso8601_tz()
+
+        device_info = {
+            API_JSON_DEVICE_KEY: {
+                "time": formatted_time,
+                "device": Config.settings['device_id'],
+                "firmware": f"{Config.settings['FIRMWARE_MAJOR']}.{Config.settings['FIRMWARE_MINOR']}.{Config.settings['FIRMWARE_PATCH']}",
+                "model": Config.settings['MODEL'],
+                "apikey": Config.settings['api_key'],
+                "source": 1,
+                "test_mode": Config.settings['TEST_MODE'],
+                "calibration_mode": Config.settings['CALIBRATION_MODE']
+            },
+            "sensors": {}
+        }
+
+        return device_info
+    
+    def save_data(self, data: dict, tag = 'normal'):
+        self.measurements[tag] = self.measurements.get(tag, []) + [data]
+        '''
+        storage.remount('/', False)
+        formatted_time = format_iso8601_tz()
+        file_name = formatted_time.replace(':', '_').replace('.', '_').replace('+', '_')
+        with open(f'{Config.runtime_settings["JSON_QUEUE"]}/{file_name}_{tag}.json', 'w') as f:
+            json.dump(data, f)
+        storage.remount('/', False)
+        '''
+    
+    def get_json(self):
+        self.read_all_sensors()
+        sensor_values = {}
+        for id, sensor in enumerate(self.sensors):
+            sensor_values[id] = {
+                "type": sensor.model_id,
+                "data": sensor.current_values
+            }
+
+        data = self.get_info()
+        data["sensors"] = sensor_values
+
+        return data
+    
+    def _flush_offline_temp_queue(self):
+        """Upload compact JSONL backlog from ``/json_queue`` when Wi-Fi is up."""
+        if Config.is_wifiless():
+            return
+        if Config.settings.get("MODEL") not in (LdProduct.AIR_STATION, LdProduct.AIR_CUBE):
+            return
+        if not WifiUtil.radio.connected:
+            return
+        from measurement_temp_queue import replay_pending_to_api
+
+        replay_pending_to_api()
+
+    def send_to_api(self):
+        self._flush_offline_temp_queue()
+        # contains all measurements that failed to transmitt
+        new_measurements = {}
+        for tag, data_list in self.measurements.items():
+            if tag == 'sensor_community':
+                for data in data_list:
+                    transmission_failed = False 
+                    for header, d in data:
+                        response = WifiUtil.send_json_to_sensor_community(header=header, data=d)
+                        if response.status_code != 200:
+                            transmission_failed = True
+                            break
+                    if transmission_failed:
+                        new_measurements[tag] = new_measurements.get(tag, []) + [data]
+            elif tag == 'normal':
+                for data in data_list:
+                    response = WifiUtil.send_json_to_api(data)
+                    if response.status_code not in (200, 422):
+                        new_measurements[tag] = new_measurements.get(tag, []) + [data]
+                
+        self.measurements = new_measurements
+
+        if not logger.log_list:
+            # Datahub ``status/`` rejects empty ``status_list`` (400 missing device/status_list).
+            return
+
+        data = self.get_info()
+        data["status_list"] = logger.log_list
+        api_url = Config.settings['DATAHUB_TEST_API_URL'] if Config.settings['TEST_MODE'] else Config.settings['DATAHUB_API_URL']
+        response = WifiUtil.send_json_to_api(
+            data=data, 
+            api_url=api_url,
+            router='status/'
+        )
+        if response.status_code == 200:
+            logger.log_list.clear()
+            # updaet flags if they exist
+            j = response.json()
+            if 'flags' in j:
+                test_mode = j['flags'].get('test_mode')
+                calibration_mode = j['flags'].get('calibration_mode')
+                changed_config = False
+                if Config.settings['TEST_MODE'] != test_mode:
+                    Config.settings['TEST_MODE'] = test_mode
+                    changed_config = True
+                if Config.settings['CALIBRATION_MODE'] != calibration_mode:
+                    Config.settings['CALIBRATION_MODE'] = calibration_mode
+                    changed_config = True
+                # restart if flags have changed
+                if changed_config:
+                    logger.info('Changed flags restart now')
+                    import supervisor
+                    supervisor.reload()
+
+    def read_all_sensors(self):
+        for sensor in self.sensors:
+            try:
+                sensor.read()
+            except:
+                logger.error(f"Error reading sensor {sensor.model_id}, using previous values")
+
+        
+    def receive_command(self, command):
+        """Process a command received on the BLE command characteristic."""
+        pass
+    
+    def _handle_wifiless_button_upload(self):
+        """Wifiless Air Station/Cube: connect Wi-Fi and upload SD JSONL backlog."""
+        from sd_logger import wifiless_button_upload_sd_backlog
+        from enums import Color
+        from led_controller import RepeatMode
+
+        self.status_led.show_led({
+            'repeat_mode': RepeatMode.TIMES,
+            'repeat_times': 1,
+            'elements': [
+                {'color': Color.BLUE, 'duration': 0.2},
+            ],
+        })
+        result = wifiless_button_upload_sd_backlog()
+        if result == 'ok':
+            self.send_to_api()
+            self.last_api_send = time.monotonic()
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.TIMES,
+                'repeat_times': 1,
+                'elements': [
+                    {'color': Color.GREEN, 'duration': 0.5},
+                ],
+            })
+            logger.info('Wifiless button upload: SD backlog sent')
+        elif result == 'partial':
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.TIMES,
+                'repeat_times': 2,
+                'elements': [
+                    {'color': Color.YELLOW, 'duration': 0.3},
+                    {'color': Color.OFF, 'duration': 0.2},
+                ],
+            })
+            logger.warning('Wifiless button upload: incomplete (some SD lines remain)')
+        else:
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.TIMES,
+                'repeat_times': 1,
+                'elements': [
+                    {'color': Color.RED, 'duration': 0.5},
+                ],
+            })
+            logger.warning(f'Wifiless button upload failed ({result})')
+
+    def receive_button_press(self):
+        """Process a button press event."""
+        pass
+    
+    def tick(self):
+        """Main loop tick. Called at regular intervals. 
+        We do not need to check for commands here, these are passed separately."""
+        pass
+    
+    def connection_update(self, connected):
+        """Callback when BLE connection status changes.
+        Will be called with False at the start of main loop."""
+        pass
+
+    def ble_configuration_incomplete(self) -> bool:
+        """True when required settings for this model are missing (override in subclasses)."""
+        return False
+
+    # The following methods do not need to be overridden by subclasses.
+    def update_ble_sensor_data(self):
+        """Read out sensors values and update BLE characteristic."""
+        vals_array = bytearray()
+        for sensor in self.sensors:
+            try:
+                sensor.read()
+            except:
+                logger.error(f"Error reading sensor {sensor.model_id}, using previous values")
+            vals_array.extend(sensor.get_current_values())
+        self.ble_service.sensor_values_characteristic = vals_array
+    
+    def update_ble_device_status(self):
+        """Refresh battery, Wi‑Fi detail, and operational flags on the BLE characteristic."""
+        from ble_status import compute_device_status_bytes
+
+        self.status = bytearray(compute_device_status_bytes(self))
+        self.ble_service.device_status_characteristic = self.status
+
+    def update_ble_battery_status(self):
+        """Read battery status and update BLE characteristic (includes operational flags)."""
+        self.update_ble_device_status()
+
+    def update_ble_error_status(self, error_code):
+        """Legacy: set Wi‑Fi detail byte and refresh full device status."""
+        from enums import BleWifiDetailCode
+
+        WifiUtil.last_wifi_detail = (
+            error_code if error_code in (
+                BleWifiDetailCode.SSID_NOT_SET,
+                BleWifiDetailCode.SSID_NOT_FOUND,
+                BleWifiDetailCode.CONNECT_FAILED,
+            ) else BleWifiDetailCode.CONNECT_FAILED
+        )
+        self.update_ble_device_status()

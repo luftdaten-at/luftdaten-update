@@ -1,0 +1,362 @@
+import time
+import json
+import board  # type: ignore
+import digitalio  # type: ignore
+import busio  # type: ignore
+import gc
+import neopixel  # type: ignore
+import traceback
+import supervisor
+
+import adafruit_ds3231
+import rtc
+from ld_service import LdService
+from adafruit_ble import BLERadio  # type: ignore
+from adafruit_ble.advertising.standard import ProvideServicesAdvertisement  # type: ignore
+
+from config import Config
+from enums import LdProduct, SensorModel, Color
+from led_controller import LedController, RepeatMode
+from wifi_client import WifiUtil
+from ugm2.upgrade_mananger import Ugm
+from logger import logger
+from models.ld_product_model import API_JSON_DEVICE_KEY
+from util import get_battery_monitor, get_connected_sensors, log_sensors_startup_summary
+from startup_actions import (
+    is_startup_flag_true,
+    probe_matches_saved_sensors_toml,
+    read_sensors_toml_expected_snapshot,
+    run_startup_actions,
+    run_startup_actions_after_sensors,
+)
+
+def main():
+    logger.debug('loaded main.py')
+    # simple lighting at initialization
+    led = neopixel.NeoPixel(board.IO8, 1)
+    led[0] = Color.YELLOW
+
+    # Load startup config
+    Config.init()
+    logger.debug('initialized Config successfully')
+
+    Ugm.init(WifiUtil, Config)
+
+    # overwrite standard config if configured in settings.toml
+    scl = Config.settings['SCL'] if Config.settings['SCL'] else board.IO5
+    sda = Config.settings['SDA'] if Config.settings['SDA'] else board.IO4
+    button_pin = Config.settings['BUTTON_PIN'] if Config.settings['BUTTON_PIN'] else board.IO9
+
+    # init bus
+    i2c = busio.I2C(scl=scl, sda=sda, frequency=20000)
+
+    # set correct time if DS3231 RTC module is connected (same I2C as sensors)
+    try:
+        rtc_with_battery = adafruit_ds3231.DS3231(i2c)
+        rtc.RTC().datetime = rtc_with_battery.datetime
+
+        Config.runtime_settings['rtc_is_set'] = True
+        Config.runtime_settings['rtc_module'] = rtc_with_battery
+        logger.info('DS3231 found: system RTC set from module time')
+        t = time.localtime()
+        logger.info(
+            'DS3231 RTC time: %04d-%02d-%02d %02d:%02d:%02d'
+            % (t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
+        )
+    except Exception as e:
+        logger.warning(f'DS3231 not available or I2C error ({type(e).__name__}: {e}); using existing RTC if any')
+
+    # One-shot flags in startup.toml (e.g. NTP → RTC/DS3231); uses Wi-Fi from settings.toml
+    run_startup_actions()
+
+    # Initialize the button at GPIO9
+    button = digitalio.DigitalInOut(button_pin)
+    button.direction = digitalio.Direction.INPUT
+
+    # get connected sensors (compare once to prior /sensors.toml; one retry if mismatch)
+    sensors_toml_snapshot = read_sensors_toml_expected_snapshot()
+    connected_sensors = get_connected_sensors(i2c)
+    battery_monitor = get_battery_monitor(i2c)
+    if not probe_matches_saved_sensors_toml(
+        connected_sensors, battery_monitor, sensors_toml_snapshot
+    ):
+        logger.warning(
+            "sensors.toml snapshot mismatch vs probe; repeating I2C sensor scan once"
+        )
+        connected_sensors = get_connected_sensors(i2c)
+        battery_monitor = get_battery_monitor(i2c)
+
+    if is_startup_flag_true("REFRESH_SENSORS"):
+        logger.info(
+            "startup.toml: REFRESH_SENSORS — forcing I2C sensor probe and sensors.toml refresh"
+        )
+        connected_sensors = get_connected_sensors(i2c)
+        battery_monitor = get_battery_monitor(i2c)
+
+    # Model from sensors: startup.toml DETECT_MODEL_FROM_SENSORS and/or legacy MODEL == -1
+    run_startup_actions_after_sensors(connected_sensors, battery_monitor)
+
+    # prepare connected sensors status for ble 
+    connected_sensors_status = bytearray([
+        len(connected_sensors),  # Number of sensors
+    ])
+
+    # list of sensors -> is passed to the model
+    sensors = []
+
+    # add connected sensors
+    for name in connected_sensors:
+        connected_sensors_status.extend([
+                name,
+                0x01,  # Connected
+            ])
+        sensors.append(connected_sensors[name])
+
+    # Initialize BLE, define custom service
+    ble = BLERadio()
+    service = LdService()
+    export_read_value_fn = None
+    try:
+        from sd_ble_export import export_read_value
+
+        export_read_value_fn = export_read_value
+        service.sd_log_export_characteristic = export_read_value()
+    except Exception as e:
+        logger.warning(f"SD BLE export characteristic init skipped ({type(e).__name__}: {e})")
+
+    # init ble name
+    ble.name = "Luftdaten.at-" + Config.settings['mac']
+
+    # Select correct Device base on Config.settings['MODEL']
+    # de initialize simple lighting, because models have to user the same pin for led controller
+    led.deinit()
+    device = None
+    if Config.settings['MODEL'] == LdProduct.AIR_AROUND or Config.settings['MODEL'] == LdProduct.AIR_BIKE:
+        from models.air_around import AirAround
+        device = AirAround(Config.settings['MODEL'], service, sensors, battery_monitor)
+    if Config.settings['MODEL'] == LdProduct.AIR_BADGE:
+        from models.air_badge import AirBadge
+        device = AirBadge(
+            ble_service=ble, 
+            sensors=sensors,
+            battery_monitor=battery_monitor,
+        )
+    if Config.settings['MODEL'] == LdProduct.AIR_CUBE:
+        from models.air_cube import AirCube
+        device = AirCube(service, sensors, battery_monitor)
+    if Config.settings['MODEL'] == LdProduct.AIR_STATION:
+        from models.air_station import AirStation
+        device = AirStation(service, sensors, battery_monitor)
+
+    if device is None:
+        logger.error(
+            f"main: device is None for MODEL={Config.settings.get('MODEL')!r} — no matching device class"
+        )
+    else:
+        device.physical_sensor_count = len(connected_sensors)
+
+    mqtt_loop_step = None
+    if device is not None:
+        _m = Config.settings.get("MODEL")
+        if _m in (LdProduct.AIR_CUBE, LdProduct.AIR_STATION) and not Config.is_wifiless():
+            from mqtt_ha import MqttHa as _MqttHa
+
+            mqtt_loop_step = _MqttHa.loop_step
+
+    # Use JSON format when api_key is set so the app can read it for workshop uploads.
+    # Binary format is used when no api_key (backward compat / first boot).
+    # Ensure portable devices have api_key for workshop uploads
+    if Config.settings['MODEL'] in (LdProduct.AIR_AROUND, LdProduct.AIR_BIKE, LdProduct.AIR_BADGE):
+        if not Config.settings.get('api_key'):
+            Config.settings['api_key'] = Config.generate_random_api_key()
+            logger.info('Generated api_key for workshop uploads')
+    try:
+        if Config.settings['api_key']:
+            device_info_json = device.get_info()
+            device_info_json[API_JSON_DEVICE_KEY]['sensor_list'] = [
+                {"model_id": s.model_id, "dimension_list": s.measures_values, "serial_number": s.get_serial_number()}
+                for s in sensors
+            ]
+            service.device_info_characteristic = bytes(json.dumps(device_info_json).encode('utf-8'))
+        else:
+            device_info_data = bytearray([
+                Config.settings['PROTOCOL_VERSION'],
+                Config.settings['FIRMWARE_MAJOR'],
+                Config.settings['FIRMWARE_MINOR'],
+                Config.settings['FIRMWARE_PATCH'],
+                0x00, 0x00, 0x00, 0x00,  # Device Name - not yet implemented
+                Config.settings['MODEL'],
+            ])
+            device_info_data.extend(connected_sensors_status)
+            # Append api_key (length-prefixed) for workshop uploads when JSON path fails
+            api_key_str = Config.settings.get('api_key') or ''
+            api_key_bytes = api_key_str.encode('utf-8') if isinstance(api_key_str, str) else bytes()
+            device_info_data.append(min(len(api_key_bytes), 255))
+            device_info_data.extend(api_key_bytes[:255])
+            service.device_info_characteristic = bytes(device_info_data)
+    except Exception as e:
+        logger.error(f"Device info setup failed, using binary fallback: {e}")
+        device_info_data = bytearray([
+            Config.settings['PROTOCOL_VERSION'],
+            Config.settings['FIRMWARE_MAJOR'],
+            Config.settings['FIRMWARE_MINOR'],
+            Config.settings['FIRMWARE_PATCH'],
+            0x00, 0x00, 0x00, 0x00,
+            Config.settings['MODEL'],
+        ])
+        device_info_data.extend(connected_sensors_status)
+        api_key_str = Config.settings.get('api_key') or ''
+        api_key_bytes = api_key_str.encode('utf-8') if isinstance(api_key_str, str) else bytes()
+        device_info_data.append(min(len(api_key_bytes), 255))
+        device_info_data.extend(api_key_bytes[:255])
+        service.device_info_characteristic = bytes(device_info_data)
+
+    # Set up sensor info characteristic (use bytes() for BLE compatibility)
+    if len(sensors) > 0:
+        sensor_info = bytearray()
+        for sensor in sensors:
+            sensor_info.extend(sensor.get_device_info())
+        service.sensor_info_characteristic = bytes(sensor_info)
+    else:
+        service.sensor_info_characteristic = bytes([0x06])
+
+    # Initial device status (battery + operational flags)
+    if device is not None:
+        device.update_ble_device_status()
+    else:
+        service.device_status_characteristic = bytes([0, 0, 0, 0, 0])
+
+    # Allow BLE stack to register characteristic values before advertising
+    time.sleep(0.2)
+    # Create services advertisement
+    advertisement = ProvideServicesAdvertisement(service)
+
+    for sensor in sensors:
+        sensor.on_start_main_loop(device)
+
+    # If a battery monitor is connected, indicate battery percentage
+    if battery_monitor is not None:
+        logger.debug('show battery state in 2 seconds')
+        time.sleep(2)
+        CRITICAL = 10
+        percent = round(battery_monitor.cell_soc())
+        points = [25, 50, 75]
+        # critical
+        if percent < CRITICAL:
+            device.status_led.status_led.fill(Color.RED)
+            device.status_led.status_led.show()
+            time.sleep(0.2)
+            device.status_led.status_led.fill(Color.OFF)
+            device.status_led.status_led.show()
+        else:
+            for point in points:
+                if percent > point:
+                    device.status_led.status_led.fill(Color.GREEN)
+                    device.status_led.status_led.show()
+                    time.sleep(0.5)
+                    device.status_led.status_led.fill(Color.OFF)
+                    device.status_led.status_led.show()
+                    time.sleep(0.5)
+        time.sleep(2)
+
+    log_sensors_startup_summary(sensors, battery_monitor)
+
+    button_state = False
+    ble_connected = False
+
+    ble.start_advertising(advertisement)
+    # Main loop
+    while True:
+        # Clean memory
+        gc.collect()
+
+        if not WifiUtil.radio.connected:
+            WifiUtil.connect()
+
+        '''
+        # Check for updates
+        if WifiUtil.radio.connected:
+            if Ugm.check_if_upgrade_available():
+                logger.info('Upgrade available, reload to install')
+                supervisor.set_next_code_file('code.py')
+                supervisor.reload()
+        '''
+
+        # perforem ugm2 update mostly for upgrading ugm
+        # check if update available
+        if (
+            not Config.is_wifiless()
+            and WifiUtil.radio.connected
+            and (folder := Ugm.check_if_upgrade_available())
+        ):
+            # Assume model is AirStation
+            device.status_led.status_led[0] = (200, 0, 80)
+            logger.debug(f'Installing new firmware from folder: {folder}')
+            try:
+                Ugm.install_update(folder)
+                supervisor.reload()
+            except Exception as e:
+                logger.critical(f'Upgrade failed: {e}')
+                supervisor.reload()
+
+        if not ble.advertising and device.ble_on and not ble.connected:
+            ble.start_advertising(advertisement)
+            logger.debug("Started advertising")
+
+        '''
+        elif ble.advertising and not device.ble_on:
+            ble.stop_advertising()
+            logger.debug("Stopped advertising")
+        '''
+
+        if ble.connected and not ble_connected:
+            ble_connected = True
+            ble.stop_advertising()
+            logger.debug("BLE connection established")
+        elif not ble.connected and ble_connected:
+            ble_connected = False
+            ble.stop_advertising()
+            ble.start_advertising(advertisement)
+            logger.debug("Disconnected from BLE device")
+        
+        device.connection_update(ble_connected)
+
+        if ble_connected and Config.is_wifiless() and export_read_value_fn is not None:
+            service.sd_log_export_characteristic = export_read_value_fn()
+
+        if button.value and not button_state:
+            button_state = True
+            device.receive_button_press()
+            logger.debug("Button pressed")
+        elif not button.value and button_state:
+            button_state = False
+            logger.debug("Button released")
+
+        if service.trigger_reading_characteristic_2:
+            command = service.trigger_reading_characteristic_2
+            service.trigger_reading_characteristic_2 = bytearray()
+
+            device.receive_command(command)
+            device.status_led.receive_command(command)
+
+        device.tick()
+        if device is not None:
+            device.update_ble_device_status()
+        device.status_led.tick()
+
+        if mqtt_loop_step is not None:
+            mqtt_loop_step()
+
+        time.sleep(device.polling_interval)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        try:
+            tb = traceback.format_exception(type(e), e, e.__traceback__)
+            full_traceback = "".join(tb)
+        except Exception:
+            full_traceback = str(e)
+        logger.critical(f"{e}\n{full_traceback}")
+        supervisor.reload()

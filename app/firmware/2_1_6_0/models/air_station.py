@@ -1,0 +1,416 @@
+import time
+import board
+import struct
+import neopixel
+from wifi_client import WifiUtil
+
+from led_controller import LedController
+from config import Config
+from models.ld_product_model import API_JSON_DEVICE_KEY, LdProductModel
+from ld_service import LdService
+from enums import LdProduct, Color, BleCommands, AirstationConfigFlags, Dimension, SensorModel
+from logger import logger
+from led_controller import RepeatMode
+from sd_logger import append_measurement_jsonl
+from measurement_temp_queue import append_offline_measurement, replay_pending_to_api
+from startup_actions import is_startup_flag_true
+
+_AIR_STATION_BLE_STARTUP_TOML = (
+    (AirstationConfigFlags.SYNC_RTC_FROM_NTP, "SYNC_RTC_FROM_NTP"),
+    (AirstationConfigFlags.DETECT_MODEL_FROM_SENSORS, "DETECT_MODEL_FROM_SENSORS"),
+    (AirstationConfigFlags.UPLOAD_SD_LOG_TO_DATAHUB, "UPLOAD_SD_LOG_TO_DATAHUB"),
+    (AirstationConfigFlags.CLEAR_SD_CARD, "CLEAR_SD_CARD"),
+    (AirstationConfigFlags.REFRESH_SENSORS, "REFRESH_SENSORS"),
+)
+
+class AirStation(LdProductModel):
+    NEOPIXEL_PIN = board.IO8
+    NEOPIXLE_N = 1
+    SCL = board.IO5
+    SDA = board.IO4
+    BUTTON_PIN = None
+
+    def __init__(self, ble_service: LdService, sensors, battery_monitor):
+        super().__init__(ble_service, sensors, battery_monitor)
+        self.model_id = LdProduct.AIR_STATION
+        self.ble_on = True
+        self.polling_interval = 2
+        self.last_measurement = None
+
+        # Load settings from boot.toml
+        self.device_id = Config.settings['device_id']
+        self.api_key = Config.settings['api_key']
+
+        # Last blocker set we warned about (avoid spamming ``tick`` every 2s).
+        self._last_xmit_blockers_key = None
+
+        # init status led
+        self.status_led = LedController(
+            status_led=neopixel.NeoPixel(
+                pin=AirStation.NEOPIXEL_PIN,
+                n=AirStation.NEOPIXLE_N
+            ),
+            n=AirStation.NEOPIXLE_N
+        )
+
+        self.send_configuration()
+
+        # Ready but not configured
+        self.status_led.show_led({
+            'repeat_mode': RepeatMode.FOREVER,
+                'elements': [
+                    {'color': Color.BLUE, 'duration': 0.5},
+                    {'color': Color.RED, 'duration': 0.5},
+            ],
+        })
+    
+    def connection_update(self, connected):
+        # Wifiless: SD/RTC status in ``_tick_wifiless`` owns the LED. Do not apply the
+        # non-wifiless "BLE disconnected" cyan blink here — ``main`` calls this every loop
+        # *before* ``tick()``, which would override green/yellow/red SD feedback.
+        if Config.is_wifiless():
+            if connected:
+                self.status_led.show_led({
+                    'repeat_mode': RepeatMode.FOREVER,
+                    'elements': [
+                        {'color': Color.GREEN, 'duration': 0.5},
+                        {'color': Color.OFF, 'duration': 0.5},
+                    ],
+                })
+            return
+        if connected:
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.FOREVER,
+                'elements': [
+                    {'color': Color.GREEN, 'duration': 0.5},
+                    {'color': Color.OFF, 'duration': 0.5},
+                ],
+            })
+        else:
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.FOREVER,
+                'elements': [
+                    {'color': Color.CYAN, 'duration': 0.5},
+                    {'color': Color.OFF, 'duration': 0.5},
+                ],
+            })
+
+    def send_configuration(self):
+        self.ble_service.air_station_configuration = self.encode_configurations()
+        
+    def receive_command(self, command):
+        if len(command) == 0:
+            return
+
+        cmd, *data = command
+
+        data = bytearray(data)
+        if cmd == BleCommands.SD_LOG_EXPORT:
+            from sd_ble_export import export_read_value, handle_export_command
+
+            act = data[0] if len(data) >= 1 else 255
+            handle_export_command(act, Config.is_wifiless())
+            self.ble_service.sd_log_export_characteristic = export_read_value()
+            return
+
+        if cmd == BleCommands.SET_AIR_STATION_CONFIGURATION:
+            wifi_config_changed = self.decode_configuration(data) 
+
+            if wifi_config_changed:
+                WifiUtil.connect()
+
+            # Update Characteristic with new data
+            self.send_configuration()
+
+    def decode_configuration(self, data):
+        from ble_config_tlv import decode_air_station_tlv
+
+        wifi_config_changed, mqtt_changed, _applied = decode_air_station_tlv(
+            data, _AIR_STATION_BLE_STARTUP_TOML
+        )
+
+        if mqtt_changed:
+            from mqtt_ha import MqttHa
+            MqttHa.notify_settings_changed_from_ble()
+
+        return wifi_config_changed
+
+    def encode_configurations(self):
+        data = bytearray()
+
+        def _as_bool(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return bool(int(v))
+            s = str(v).strip().lower() if v is not None else ""
+            return s in ("1", "true", "yes", "on")
+
+        mqtt_rows = [
+            (AirstationConfigFlags.MQTT_ENABLED, 1 if _as_bool(Config.settings.get("MQTT_ENABLED")) else 0),
+            (AirstationConfigFlags.MQTT_BROKER, Config.settings.get("MQTT_BROKER") or ""),
+            (AirstationConfigFlags.MQTT_PORT, int(Config.settings.get("MQTT_PORT") or 1883)),
+            (AirstationConfigFlags.MQTT_USE_TLS, 1 if _as_bool(Config.settings.get("MQTT_USE_TLS")) else 0),
+            (AirstationConfigFlags.MQTT_USERNAME, Config.settings.get("MQTT_USERNAME") or ""),
+            (AirstationConfigFlags.MQTT_DISCOVERY_PREFIX, Config.settings.get("MQTT_DISCOVERY_PREFIX") or "homeassistant"),
+            (AirstationConfigFlags.MQTT_DEVICE_NAME, Config.settings.get("MQTT_DEVICE_NAME") or ""),
+        ]
+        cert = Config.settings.get("MQTT_CERTIFICATE_PATH")
+        if cert and str(cert).strip():
+            mqtt_rows.append((AirstationConfigFlags.MQTT_CERTIFICATE_PATH, str(cert).strip()))
+
+        startup_rows = [
+            (flt, 1 if is_startup_flag_true(key) else 0)
+            for flt, key in _AIR_STATION_BLE_STARTUP_TOML
+        ]
+
+        for flag, value in [
+            (AirstationConfigFlags.AUTO_UPDATE_MODE, Config.settings['auto_update_mode']),
+            (AirstationConfigFlags.BATTERY_SAVE_MODE, Config.settings['battery_save_mode']),
+            (AirstationConfigFlags.MEASUREMENT_INTERVAL, Config.settings['measurement_interval']),
+            (AirstationConfigFlags.LONGITUDE, Config.settings['longitude']),
+            (AirstationConfigFlags.LATITUDE, Config.settings['latitude']),
+            (AirstationConfigFlags.HEIGHT, Config.settings['height']),
+            (AirstationConfigFlags.TZ, str(Config.settings.get('TZ') or 'Europe/Vienna')),
+            (
+                AirstationConfigFlags.LOG_LEVEL,
+                str(Config.settings.get('LOG_LEVEL') or 'DEBUG'),
+            ),
+            (AirstationConfigFlags.API_KEY, str(Config.settings.get('api_key') or '')),
+            (AirstationConfigFlags.DEVICE_ID, self.device_id),
+        ] + mqtt_rows + startup_rows:
+            value_bytes = value.encode('utf-8') if isinstance(value, str) else struct.pack('>i', value)
+            data.append(flag)
+            data.append(len(value_bytes) if isinstance(value, str) else struct.calcsize('>i'))
+            data.extend(value_bytes)
+        
+        return data
+
+    def receive_button_press(self):
+        if Config.is_wifiless():
+            self._handle_wifiless_button_upload()
+
+    @staticmethod
+    def _settings_toml_key_blank(key: str) -> bool:
+        """True if the value is missing or only whitespace (``height`` may be ``\"0\"``)."""
+        v = Config.settings.get(key)
+        if v is None:
+            return True
+        return not str(v).strip()
+
+    def ble_configuration_incomplete(self) -> bool:
+        if Config.is_wifiless():
+            return not Config.runtime_settings.get("rtc_is_set")
+        return bool(self._configuration_blockers())
+
+    def _configuration_blockers(self) -> list[str]:
+        """Reasons live API upload cannot run (excluding Wi‑Fi link)."""
+        reasons = []
+        if not Config.runtime_settings.get("rtc_is_set"):
+            reasons.append("RTC not set (connect Wi‑Fi and wait for NTP)")
+        if self._settings_toml_key_blank("latitude"):
+            reasons.append("latitude unset or empty in settings.toml")
+        if self._settings_toml_key_blank("longitude"):
+            reasons.append("longitude unset or empty in settings.toml")
+        if self._settings_toml_key_blank("height"):
+            reasons.append("height unset or empty in settings.toml")
+        return reasons
+
+    def _data_transmit_blockers(self) -> list[str]:
+        """Human-readable reasons Air Station Wi‑Fi mode will not enqueue measurements."""
+        reasons = list(self._configuration_blockers())
+        if not WifiUtil.radio.connected:
+            reasons.append("WiFi not connected")
+        return reasons
+
+    def _show_offline_buffer_led(self, ok: bool) -> None:
+        if ok and Config.runtime_settings.get("rtc_is_set"):
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.PERMANENT,
+                'color': Color.GREEN_LOW,
+            })
+        elif ok:
+            logger.warning('SD log write ok but RTC not set; timestamps may be wrong')
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.PERMANENT,
+                'color': Color.YELLOW,
+            })
+        else:
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.FOREVER,
+                'elements': [
+                    {'color': Color.RED, 'duration': 0.5},
+                    {'color': Color.YELLOW, 'duration': 0.5},
+                ],
+            })
+
+    def _tick_wifi_offline(self) -> None:
+        """Wi-Fi down in normal mode: keep measuring and buffer in ``/json_queue``."""
+        cur_time = time.monotonic()
+        if (
+            not self.last_measurement
+            or cur_time - self.last_measurement >= Config.settings['measurement_interval']
+        ):
+            self.last_measurement = cur_time
+            data = self.get_json()
+            ok = append_offline_measurement(data)
+            self._show_offline_buffer_led(ok)
+
+    @staticmethod
+    def _api_location_dict():
+        """Lat/lon/height as floats or ``None`` for the station API (never empty strings)."""
+        def num(v):
+            if v is None or (isinstance(v, str) and not str(v).strip()):
+                return None
+            try:
+                return float(str(v).strip())
+            except (TypeError, ValueError):
+                return None
+
+        lat = num(Config.settings.get("latitude"))
+        lon = num(Config.settings.get("longitude"))
+        height = num(Config.settings.get("height"))
+        # Station API requires ``location`` with lat/lon/height (use null when unset).
+        return {"lat": lat, "lon": lon, "height": height}
+
+    def get_info(self):
+        device_info = super().get_info()
+        device_info[API_JSON_DEVICE_KEY]["location"] = AirStation._api_location_dict()
+        #device_info[API_JSON_DEVICE_KEY]['calibration_mode'] = Config.runtime_settings['CALIBRATION_MODE']
+
+        return device_info
+    
+    def get_json_list_sensor_community(self):
+        '''
+        // header
+        Content-Type: application/json  
+        X-Pin: ...
+        X-Sensor: ...
+        // data
+        {
+            "software_version": "your_version", 
+            "sensordatavalues":[
+                {"value_type":"temperature","value":"22.30"},
+                {"value_type":"humidity","value":"34.70"}
+            ]
+        } 
+        '''
+        self.read_all_sensors()
+        software_version = f"Luftdaten.at-{Config.settings['FIRMWARE_MAJOR']}.{Config.settings['FIRMWARE_MINOR']}.{Config.settings['FIRMWARE_PATCH']}"
+
+        # Tuple(header, data)
+        dict_list = [
+            (
+                # header
+                {
+                    'Content-Type': 'application/json',
+                    # GPS(Neo-6M) => Pin 9
+                    'X-Pin': '9',
+                    'X-Sensor': Config.settings['device_id']
+                },
+                #data
+                {
+                    "software_version": software_version,
+                    "sensordatavalues": [
+                        {'value_type': 'latitude', 'value': Config.settings.get("latitude", None)},
+                        {'value_type': 'longitude', 'value': Config.settings.get("longitude", None)},
+                        {'value_type': 'height', 'value': Config.settings.get("height", None)}
+                    ]
+                }
+            )
+        ]
+
+        for sensor in self.sensors:
+            header={
+                'Content-Type': 'application/json',
+                'X-Pin': str(SensorModel.get_pin(sensor.model_id)),
+                'X-Sensor': Config.settings['device_id']
+            }
+            sensordatavalues = []
+            for dim, val in sensor.current_values.items():
+                sensordatavalues.append({
+                    "value_type": Dimension.get_sensor_community_name(dim),
+                    "value": val
+                })
+
+            data = {
+                "software_version": software_version,
+                "sensordatavalues": sensordatavalues
+            }
+
+            dict_list.append((header, data))
+
+        return dict_list
+
+    def _tick_wifiless(self):
+        """Log measurements to SD; no WiFi/API or in-RAM measurement queue."""
+        cur_time = time.monotonic()
+        if not self.last_measurement or cur_time - self.last_measurement >= Config.settings['measurement_interval']:
+            self.last_measurement = cur_time
+            data = self.get_json()
+            ok = append_measurement_jsonl(data)
+            self._show_offline_buffer_led(ok)
+
+    def tick(self):
+        if Config.is_wifiless():
+            self._tick_wifiless()
+            # When Wi‑Fi is available (e.g. NTP / upload bootstrap), still push logs via datahub ``status/``.
+            if WifiUtil.radio.connected:
+                if (
+                    not self.last_api_send
+                    or time.monotonic() - self.last_api_send > self.api_send_interval
+                ):
+                    self.last_api_send = time.monotonic()
+                    self.send_to_api()
+            return
+
+        if not Config.runtime_settings['rtc_is_set'] and WifiUtil.radio.connected:
+            WifiUtil.set_RTC()
+
+        if WifiUtil.radio.connected:
+            replay_pending_to_api()
+
+        if not WifiUtil.radio.connected:
+            self._tick_wifi_offline()
+            return
+
+        blockers = self._configuration_blockers()
+        if blockers:
+            bkey = tuple(blockers)
+            if bkey != self._last_xmit_blockers_key:
+                self._last_xmit_blockers_key = bkey
+                logger.warning(
+                    "DATA CANNOT BE TRANSMITTED, not all configurations have been made: "
+                    + "; ".join(blockers)
+                )
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.FOREVER,
+                    'elements': [
+                        {'color': Color.BLUE, 'duration': 0.5},
+                        {'color': Color.RED, 'duration': 0.5},
+                ],
+            })
+        else:
+            self._last_xmit_blockers_key = None
+            self.status_led.show_led({
+                'repeat_mode': RepeatMode.PERMANENT,
+                'color': Color.GREEN_LOW,
+            })
+            cur_time = time.monotonic()
+            if not self.last_measurement or cur_time - self.last_measurement >= Config.settings['measurement_interval']:
+                self.last_measurement = cur_time
+                data = self.get_json()
+
+                self.save_data(data)
+
+                from mqtt_ha import MqttHa
+                MqttHa.publish_measurement_if_enabled(data)
+
+                if Config.settings['SEND_TO_SENSOR_COMMUNITY']:
+                    sensor_community_data = self.get_json_list_sensor_community()
+                    self.save_data(sensor_community_data, tag='sensor_community')
+
+        if not self.last_api_send or time.monotonic() - self.last_api_send > self.api_send_interval:
+            if WifiUtil.radio.connected:
+                self.last_api_send = time.monotonic()
+                self.send_to_api()

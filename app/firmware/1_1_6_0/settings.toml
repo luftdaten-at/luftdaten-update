@@ -1,0 +1,19 @@
+MODEL = -1
+TEST_MODE = false 
+SSID = ""
+PASSWORD = ""
+SEND_TO_SENSOR_COMMUNITY = false
+# LOG_LEVEL = "INFO"
+
+# Timestamps for API/logs: default Europe/Vienna if omitted. See docs/settings.md (TZ).
+# TZ = "UTC"
+
+# Air Station: SD log instead of API
+WIFILESS_MODE = false
+# SD_LOG_PATH = "/sd/measurements.jsonl"
+
+# Home Assistant MQTT (optional; Air Cube / Air Station Wi‑Fi). See docs/mqtt-home-assistant.md
+# MQTT_ENABLED = true
+# MQTT_BROKER = ""
+# MQTT_PORT = 1883
+# MQTT_USE_TLS = false
